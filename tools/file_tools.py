@@ -116,6 +116,20 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
     return None
 
 
+def _safe_getcwd() -> str:
+    """Return the current working directory, tolerating a deleted CWD.
+
+    ``os.getcwd()`` raises FileNotFoundError when the process's working
+    directory has been removed out from under it (e.g. a scratch workspace
+    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
+    user's home directory, so file resolution never crashes on a stale CWD.
+    """
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+
+
 def _resolve_base_dir(task_id: str = "default") -> Path:
     """Return the ABSOLUTE base directory for resolving relative paths.
 
@@ -139,11 +153,11 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
         base = Path(live).expanduser()
     else:
         raw = os.environ.get("TERMINAL_CWD")
-        base = Path(raw).expanduser() if raw else Path(os.getcwd())
+        base = Path(raw).expanduser() if raw else Path(_safe_getcwd())
     if not base.is_absolute():
         # A relative base (".", "./sub", "..") is anchored to the process cwd
         # once, here, so the result no longer depends on cwd at resolve() time.
-        base = Path(os.getcwd()) / base
+        base = Path(_safe_getcwd()) / base
     return base.resolve()
 
 

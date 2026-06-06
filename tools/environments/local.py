@@ -39,6 +39,20 @@ def _msys_to_windows_path(cwd: str) -> str:
     return f"{drive}:{tail or chr(92)}"  # chr(92) = backslash, avoid raw-string escape
 
 
+def _safe_getcwd() -> str:
+    """Return the current working directory, tolerating a deleted CWD.
+
+    ``os.getcwd()`` raises FileNotFoundError when the process's working
+    directory has been removed out from under it (e.g. a scratch workspace
+    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
+    user's home directory, so environment setup never crashes on a stale CWD.
+    """
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+
+
 def _resolve_safe_cwd(cwd: str) -> str:
     """Return ``cwd`` if it exists as a directory, else the nearest existing
     ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
@@ -444,7 +458,7 @@ class LocalEnvironment(BaseEnvironment):
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         if cwd:
             cwd = os.path.expanduser(cwd)
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        super().__init__(cwd=cwd or _safe_getcwd(), timeout=timeout, env=env)
         self.init_session()
 
     def get_temp_dir(self) -> str:
