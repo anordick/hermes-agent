@@ -151,7 +151,15 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     except Exception:
         return (True, "")  # can't probe — silent
     try:
-        pid = get_running_pid()
+        # Resolve PID path from the ROOT Hermes home, not the profile-specific
+        # one. The gateway always writes its PID/lock files to the root home
+        # (~/.hermes/), but when this function runs under a profile (e.g.
+        # helm, anvil), get_hermes_home() returns the profile-specific path
+        # (~/.hermes/profiles/<name>/), causing a false negative.
+        from hermes_constants import get_default_hermes_root
+        root_home = get_default_hermes_root()
+        pid_path = root_home / "gateway.pid"
+        pid = get_running_pid(pid_path=pid_path)
     except Exception:
         return (True, "")  # probe errored — silent
 

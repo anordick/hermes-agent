@@ -6388,7 +6388,7 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
         return True
     try:
         for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
+            if skill_md.is_file() and ".archive" not in skill_md.parts:
                 return True
     except OSError:
         pass
@@ -6519,6 +6519,17 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Resolve the worker's direct supervisor from org_graph.yaml so the
+    # worker can create an escalation handoff card when blocked outside
+    # its role/authority.  The supervisor is the profile's immediate
+    # superior in the org hierarchy (one level up).  Subordinate workers
+    # MUST never get HERMES_SUPERVISOR=mobius — human escalation goes
+    # through Vaile alone via the Discord surfacing channel.
+    # See KANBAN_GUIDANCE for the worker-side escalation protocol.
+    supervisor = _resolve_supervisor(profile_arg)
+    if supervisor:
+        env["HERMES_SUPERVISOR"] = supervisor
 
     cmd = [
         *_resolve_hermes_argv(),
@@ -7284,7 +7295,8 @@ def list_profiles_on_disk() -> list[str]:
 
     Includes:
     - named profiles under ``<default-root>/profiles/<name>/config.yaml``
-    - the implicit ``default`` profile when the default Hermes root exists
+    - the implicit root profile as the org-facing ``vaile`` assignee when
+      the default Hermes root exists
 
     Reads profile paths directly so this module has no import dependency on
     ``hermes_cli.profiles`` (which pulls in a large chunk of the CLI startup
@@ -7299,7 +7311,7 @@ def list_profiles_on_disk() -> list[str]:
 
     names: set[str] = set()
     if default_root.exists():
-        names.add("default")
+        names.add("vaile")
 
     if profiles_dir.is_dir():
         try:
@@ -7312,6 +7324,58 @@ def list_profiles_on_disk() -> list[str]:
             pass
 
     return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# Supervisor resolution (org_graph.yaml)
+# ---------------------------------------------------------------------------
+
+def _resolve_supervisor(profile_name: str) -> str | None:
+    """Return the immediate supervisor for ``profile_name`` from
+    ``org_graph.yaml``, or ``None`` when the profile is unknown or its
+    supervisor would be ``mobius`` (subordinate workers must never target
+    Mobius — human escalation goes through Vaile only).
+
+    Reads ``<hermes-home>/org_graph.yaml``.  Safe to call at import time
+    or runtime — the file is tiny (<300 lines) and caches poorly so we
+    always re-read.
+    """
+    import os
+    import yaml
+
+    try:
+        from hermes_constants import get_default_hermes_root
+        org_path = get_default_hermes_root() / "org_graph.yaml"
+    except Exception:
+        return None
+
+    if not org_path.is_file():
+        return None
+
+    try:
+        with open(str(org_path)) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return None
+
+    profiles = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(profiles, dict):
+        return None
+
+    entry = profiles.get(profile_name)
+    if not isinstance(entry, dict):
+        return None
+
+    supervisor = entry.get("supervisor")
+    if not supervisor or not isinstance(supervisor, str):
+        return None
+
+    # Subordinate workers must never target Mobius directly — human
+    # escalation goes through Vaile's Discord surfacing channel only.
+    if supervisor.strip().lower() == "mobius":
+        return None
+
+    return supervisor.strip()
 
 
 def known_assignees(conn: sqlite3.Connection) -> list[dict]:

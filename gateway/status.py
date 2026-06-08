@@ -996,6 +996,37 @@ def clear_planned_stop_marker() -> None:
         pass
 
 
+def _find_gateway_by_proc_scan() -> Optional[int]:
+    """Scan /proc for running gateway processes when PID/lock files are missing.
+
+    Iterates /proc entries looking for processes whose cmdline matches
+    gateway patterns (``hermes_cli.main gateway``, ``gateway run``, etc.).
+    Returns the first matching PID, or ``None`` if no gateway is found.
+
+    This is a fallback for when the runtime lock file has been deleted
+    from the filesystem while the gateway still holds the flock on the
+    open file descriptor — the FD shows as ``(deleted)`` in
+    ``/proc/<pid>/fd/`` and ``is_gateway_runtime_lock_active()`` returns
+    False because the file no longer exists on disk.
+    """
+    try:
+        proc = Path("/proc")
+        if not proc.exists():
+            return None
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                pid = int(entry.name)
+            except ValueError:
+                continue
+            if _looks_like_gateway_process(pid):
+                return pid
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
 def get_running_pid(
     pid_path: Optional[Path] = None,
     *,
@@ -1005,12 +1036,30 @@ def get_running_pid(
 
     Checks the PID file and verifies the process is actually alive.
     Cleans up stale PID files automatically.
+
+    When the runtime lock file is missing (e.g. deleted while the gateway
+    was still running, or the caller is in a profile-scoped Hermes home),
+    falls back to scanning /proc for running gateway processes.
     """
     resolved_pid_path = pid_path or _get_pid_path()
     resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
     lock_active = is_gateway_runtime_lock_active(resolved_lock_path)
     if not lock_active:
+        # Snapshot whether the PID file existed before cleanup, so the
+        # proc-scan fallback only fires when there was truly no PID file
+        # (lock deleted case), not when a PID file existed but pointed
+        # at a non-gateway process (which should still return None).
+        _pid_file_existed = resolved_pid_path.exists()
         _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+        if not _pid_file_existed:
+            # Fallback: scan /proc for running gateway processes when the
+            # lock file is missing or stale. This handles two cases:
+            # 1. Lock file was deleted from the filesystem while the gateway
+            #    still holds the flock on the open FD (the FD shows as
+            #    "(deleted)" in /proc/<pid>/fd/).
+            # 2. Caller is in a profile-scoped Hermes home and the lock file
+            #    lives at the root Hermes home instead.
+            return _find_gateway_by_proc_scan()
         return None
 
     primary_record = _read_pid_record(resolved_pid_path)
@@ -1033,6 +1082,12 @@ def get_running_pid(
             return pid
 
     _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+    # Fallback: scan /proc when PID file records are stale or missing
+    # but a gateway process is still alive. Only run when the PID file
+    # itself is absent — if it exists but points to a non-gateway
+    # process, respect that determination.
+    if not resolved_pid_path.exists():
+        return _find_gateway_by_proc_scan()
     return None
 
 
