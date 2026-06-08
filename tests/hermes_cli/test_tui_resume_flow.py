@@ -59,15 +59,13 @@ def test_cmd_chat_tui_continue_uses_latest_tui_session(monkeypatch, main_mod):
     assert captured["resume"] == "20260408_235959_a1b2c3"
 
 
-def test_cmd_chat_tui_continue_falls_back_to_latest_cli_session(monkeypatch, main_mod):
+def test_cmd_chat_tui_continue_falls_back_to_latest_any_source(monkeypatch, main_mod):
     calls = []
     captured = {}
 
     def fake_resolve_last(source="cli"):
         calls.append(source)
-        if source == "tui":
-            return None
-        if source == "cli":
+        if source is None:
             return "20260408_235959_d4e5f6"
         return None
 
@@ -89,8 +87,34 @@ def test_cmd_chat_tui_continue_falls_back_to_latest_cli_session(monkeypatch, mai
     with pytest.raises(SystemExit):
         main_mod.cmd_chat(_args(continue_last=True))
 
-    assert calls == ["tui", "cli"]
+    assert calls == ["tui", None]
     assert captured["resume"] == "20260408_235959_d4e5f6"
+
+
+def test_cmd_chat_cli_continue_falls_back_to_latest_any_source(monkeypatch, main_mod):
+    calls = []
+    captured = {}
+
+    def fake_resolve_last(source="cli"):
+        calls.append(source)
+        if source is None:
+            return "20260408_235959_discord"
+        return None
+
+    def fake_cli_main(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(main_mod, "_resolve_last_session", fake_resolve_last)
+    monkeypatch.setattr(main_mod, "_resolve_session_by_name_or_id", lambda val: val)
+    monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None)
+    monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+    monkeypatch.setattr(main_mod, "_termux_should_prefetch_update_check", lambda: False)
+    monkeypatch.setitem(sys.modules, "cli", types.SimpleNamespace(main=fake_cli_main))
+
+    main_mod.cmd_chat(_args(continue_last=True, query=None, tui=False))
+
+    assert calls == ["cli", None]
+    assert captured["resume"] == "20260408_235959_discord"
 
 
 def test_cmd_chat_tui_resume_resolves_title_before_launch(monkeypatch, main_mod):

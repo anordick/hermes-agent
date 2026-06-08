@@ -350,6 +350,55 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
+def _check_gateway_service_exec_path(issues: list[str]) -> None:
+    """Verify the systemd service file's ExecStart path resolves to an actual file."""
+    try:
+        from hermes_cli.gateway import (
+            get_systemd_unit_path,
+            is_linux,
+        )
+        from hermes_cli.service_manager import detect_service_manager
+    except Exception as e:
+        check_warn("Gateway service ExecStart", f"(could not import gateway helpers: {e})")
+        return
+
+    if not is_linux():
+        return
+
+    if detect_service_manager() == "s6":
+        return
+
+    unit_path = get_systemd_unit_path()
+    if not unit_path.exists():
+        return
+
+    try:
+        content = unit_path.read_text()
+    except Exception as e:
+        check_warn("Gateway service file", f"(could not read {unit_path}: {e})")
+        return
+
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("ExecStart="):
+            exec_path = line[len("ExecStart="):].strip()
+            # Strip any leading/trailing quotes
+            exec_path = exec_path.strip("\"'")
+            # Take just the executable path (before any arguments)
+            exec_bin = exec_path.split()[0] if exec_path else ""
+            if exec_bin and not os.path.isfile(exec_bin):
+                check_fail(
+                    "Gateway service ExecStart path broken",
+                    f"({exec_bin} does not exist — run 'hermes gateway install' to regenerate)",
+                )
+                issues.append(
+                    f"Regenerate gateway service file: hermes gateway install"
+                )
+            elif exec_bin:
+                check_ok("Gateway service ExecStart path", f"({exec_bin})")
+            break
+
+
 _APIKEY_PROVIDERS_CACHE: list | None = None
 
 
@@ -1116,6 +1165,7 @@ def run_doctor(args):
             pass
 
     _check_gateway_service_linger(issues)
+    _check_gateway_service_exec_path(issues)
     _check_s6_supervision(issues)
 
     if sys.platform != "win32":
@@ -1145,7 +1195,7 @@ def run_doctor(args):
                 "(hermes not in venv/bin/ or .venv/bin/ — reinstall with pip install -e '.[all]')"
             )
             manual_issues.append(
-                f"Reinstall entry point: cd {PROJECT_ROOT} && source venv/bin/activate && pip install -e '.[all]'"
+                f"Reinstall entry point: cd {PROJECT_ROOT} && source .venv/bin/activate && pip install -e '.[all]'"
             )
         else:
             check_ok(f"Venv entry point exists ({_venv_bin.relative_to(PROJECT_ROOT)})")

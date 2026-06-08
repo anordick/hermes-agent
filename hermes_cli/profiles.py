@@ -196,6 +196,12 @@ _RESERVED_NAMES = frozenset({
     "hermes", "default", "test", "tmp", "root", "sudo",
 })
 
+# Org-facing name for the root/default profile.  ``default`` remains a
+# compatibility alias, but the fleet should route and display the root
+# profile as ``vaile``.
+CANONICAL_ROOT_PROFILE_NAME = "vaile"
+_ROOT_PROFILE_ALIASES = frozenset({"default", CANONICAL_ROOT_PROFILE_NAME})
+
 # Hermes subcommands that cannot be used as profile names/aliases
 _HERMES_SUBCOMMANDS = frozenset({
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
@@ -281,7 +287,7 @@ def validate_profile_name(name: str) -> None:
     at alias-creation time anyway. ``default`` is a special pass-through —
     it's a valid alias for the built-in root profile.
     """
-    if name == "default":
+    if name in _ROOT_PROFILE_ALIASES:
         return  # special alias for ~/.hermes
     if not _PROFILE_ID_RE.match(name):
         raise ValueError(
@@ -299,7 +305,7 @@ def validate_profile_name(name: str) -> None:
 def get_profile_dir(name: str) -> Path:
     """Resolve a profile name to its HERMES_HOME directory."""
     canon = normalize_profile_name(name)
-    if canon == "default":
+    if canon in _ROOT_PROFILE_ALIASES:
         return _get_default_hermes_home()
     return _get_profiles_root() / canon
 
@@ -307,7 +313,7 @@ def get_profile_dir(name: str) -> Path:
 def profile_exists(name: str) -> bool:
     """Check whether a profile directory exists."""
     canon = normalize_profile_name(name)
-    if canon == "default":
+    if canon in _ROOT_PROFILE_ALIASES:
         return True
     return get_profile_dir(canon).is_dir()
 
@@ -613,7 +619,7 @@ def list_profiles() -> List[ProfileInfo]:
         dist_name, dist_version, dist_source = _read_distribution_meta(default_home)
         meta = read_profile_meta(default_home)
         profiles.append(ProfileInfo(
-            name="default",
+            name=CANONICAL_ROOT_PROFILE_NAME,
             path=default_home,
             is_default=True,
             gateway_running=_check_gateway_running(default_home),
@@ -705,9 +711,9 @@ def create_profile(
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
 
-    if canon == "default":
+    if canon in _ROOT_PROFILE_ALIASES:
         raise ValueError(
-            "Cannot create a profile named 'default' — it is the built-in profile (~/.hermes)."
+            f"Cannot create a profile named {canon!r} — it aliases the built-in root profile (~/.hermes)."
         )
 
     profile_dir = get_profile_dir(canon)
@@ -882,9 +888,9 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
 
-    if canon == "default":
+    if canon in _ROOT_PROFILE_ALIASES:
         raise ValueError(
-            "Cannot delete the default profile (~/.hermes).\n"
+            "Cannot delete the root profile (~/.hermes).\n"
             "To remove everything, use: hermes uninstall"
         )
 
@@ -1189,26 +1195,31 @@ def _stop_gateway_process(profile_dir: Path) -> None:
 def get_active_profile() -> str:
     """Read the sticky active profile name.
 
-    Returns ``"default"`` if no active_profile file exists or it's empty.
+    Returns ``"vaile"`` if no active_profile file exists or it's empty.
     """
     path = _get_active_profile_path()
     try:
         name = path.read_text().strip()
         if not name:
-            return "default"
+            return CANONICAL_ROOT_PROFILE_NAME
+        try:
+            if normalize_profile_name(name) in _ROOT_PROFILE_ALIASES:
+                return CANONICAL_ROOT_PROFILE_NAME
+        except ValueError:
+            pass
         return name
     except (FileNotFoundError, UnicodeDecodeError, OSError):
-        return "default"
+        return CANONICAL_ROOT_PROFILE_NAME
 
 
 def set_active_profile(name: str) -> None:
     """Set the sticky active profile.
 
-    Writes to ``~/.hermes/active_profile``. Use ``"default"`` to clear.
+    Writes to ``~/.hermes/active_profile``. Use ``"default"`` or ``"vaile"`` to clear.
     """
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
-    if canon != "default" and not profile_exists(canon):
+    if canon not in _ROOT_PROFILE_ALIASES and not profile_exists(canon):
         raise FileNotFoundError(
             f"Profile '{canon}' does not exist. "
             f"Create it with: hermes profile create {canon}"
@@ -1216,7 +1227,7 @@ def set_active_profile(name: str) -> None:
 
     path = _get_active_profile_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if canon == "default":
+    if canon in _ROOT_PROFILE_ALIASES:
         # Remove the file to indicate default
         path.unlink(missing_ok=True)
     else:
@@ -1229,7 +1240,7 @@ def set_active_profile(name: str) -> None:
 def get_active_profile_name() -> str:
     """Infer the current profile name from HERMES_HOME.
 
-    Returns ``"default"`` if HERMES_HOME is not set or points to ``~/.hermes``.
+    Returns ``"vaile"`` if HERMES_HOME is not set or points to ``~/.hermes``.
     Returns the profile name if HERMES_HOME points into ``~/.hermes/profiles/<name>``.
     Returns ``"custom"`` if HERMES_HOME is set to an unrecognized path.
     """
@@ -1239,7 +1250,7 @@ def get_active_profile_name() -> str:
 
     default_resolved = _get_default_hermes_home().resolve()
     if resolved == default_resolved:
-        return "default"
+        return CANONICAL_ROOT_PROFILE_NAME
 
     profiles_root = _get_profiles_root().resolve()
     try:
@@ -1298,18 +1309,24 @@ def export_profile(name: str, output_path: str) -> Path:
     # shutil.make_archive wants the base name without extension
     base = str(output).removesuffix(".tar.gz").removesuffix(".tgz")
 
-    if canon == "default":
+    if canon in _ROOT_PROFILE_ALIASES:
         # The default profile IS ~/.hermes itself — its parent is ~/ and its
-        # directory name is ".hermes", not "default".  We stage a clean copy
-        # under a temp dir so the archive contains ``default/...``.
+        # directory name is ".hermes", not "default" or "vaile".  We stage a
+        # clean copy under a temp dir so the archive contains the requested
+        # root-profile alias.
+        staged_name = (
+            CANONICAL_ROOT_PROFILE_NAME
+            if canon == CANONICAL_ROOT_PROFILE_NAME
+            else "default"
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
-            staged = Path(tmpdir) / "default"
+            staged = Path(tmpdir) / staged_name
             shutil.copytree(
                 profile_dir,
                 staged,
                 ignore=_default_export_ignore(profile_dir),
             )
-            result = shutil.make_archive(base, "gztar", tmpdir, "default")
+            result = shutil.make_archive(base, "gztar", tmpdir, staged_name)
             return Path(result)
 
     # Named profiles — stage a filtered copy to exclude credentials
@@ -1539,10 +1556,10 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     validate_profile_name(old_canon)
     validate_profile_name(new_canon)
 
-    if old_canon == "default":
-        raise ValueError("Cannot rename the default profile.")
-    if new_canon == "default":
-        raise ValueError("Cannot rename to 'default' — it is reserved.")
+    if old_canon in _ROOT_PROFILE_ALIASES:
+        raise ValueError("Cannot rename the root profile.")
+    if new_canon in _ROOT_PROFILE_ALIASES:
+        raise ValueError(f"Cannot rename to {new_canon!r} — it aliases the root profile.")
 
     old_dir = get_profile_dir(old_canon)
     new_dir = get_profile_dir(new_canon)

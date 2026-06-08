@@ -355,6 +355,12 @@ class HonchoClientConfig:
     # "context" — auto-injected context only, Honcho tools removed
     # "tools"   — Honcho tools only, no auto-injected context
     recall_mode: str = "hybrid"
+    # Context dedup — when True, prefetch() scans combined context for
+    # contradictory statements (name/role/preference conflicts) and keeps
+    # the most recent/authoritative version before injecting into the
+    # system prompt.  Lightweight regex/heuristic pass handles the common
+    # case; no LLM fallback is used to keep latency at zero.
+    dedup_enabled: bool = True
     # Eager init in tools mode — when true, initializes session during
     # initialize() instead of deferring to first tool call
     init_on_session_start: bool = False
@@ -587,6 +593,11 @@ class HonchoClientConfig:
                 host_block.get("recallMode")
                 or raw.get("recallMode")
                 or "hybrid"
+            ),
+            dedup_enabled=_resolve_bool(
+                host_block.get("dedupEnabled"),
+                raw.get("dedupEnabled"),
+                default=True,
             ),
             init_on_session_start=_resolve_bool(
                 host_block.get("initOnSessionStart"),

@@ -762,6 +762,10 @@ class HonchoMemoryProvider(MemoryProvider):
         # ----- Port #3265: token budget enforcement -----
         result = self._truncate_to_budget(result)
 
+        # ----- Context dedup -----
+        if result and self._config and self._config.dedup_enabled:
+            result = self._dedup_context(result)
+
         return result
 
     def _truncate_to_budget(self, text: str) -> str:
@@ -1091,6 +1095,112 @@ class HonchoMemoryProvider(MemoryProvider):
         if cls._TRIVIAL_PROMPT_RE.match(stripped):
             return True
         return False
+
+    # ---- Context dedup ----
+    #
+    # Subject-key patterns — extracts a canonical subject key from a line so
+    # contradictions can be grouped.  Each entry: (category, value_extractor_regex)
+    _DEDUP_SUBJECT_KEYS: list[tuple[str, re.Pattern | None]] = [
+        # Name statements — extracts the name value
+        ("name", re.compile(
+            r"(?:user(?:'s)?\s+name\s+(?:is|:)|the\s+user\s+is\s+(?:called|named))\s+['\"]?([A-Za-z][a-zA-Z]+)['\"]?",
+            re.IGNORECASE,
+        )),
+        # Role/identity statements
+        ("role", re.compile(
+            r"(?:the\s+user\s+is\s+(?:a|an)\s+|classified\s+as\s+(?:a|an)\s+)(developer|designer|engineer|writer|researcher|student|founder|consultant|manager|lead|architect|analyst|scientist|operator|admin|creator|tester|contributor)",
+            re.IGNORECASE,
+        )),
+    ]
+
+    def _dedup_context(self, text: str) -> str:
+        """Scrub contradictions from combined context.
+
+        Keeps the *last* occurrence of each contradictory fact group,
+        so more recent context (dialectic supplement) wins over older
+        context (base representation/card).  Pure regex/heuristic —
+        zero LLM, zero latency.
+
+        Returns deduplicated text with contradictions removed.
+        """
+        if not text:
+            return text
+
+        # Strategy: split into sections by "## " heading boundaries, then
+        # track "category:value" triples within each section.
+        # When the same category+value appears in a later section with a
+        # *different* value for the same category, the earlier conflicting
+        # lines are suppressed.
+
+        sections = re.split(r'\n(?=## )', text)
+        if len(sections) < 2:
+            return text  # single section — nothing to dedup
+
+        # seen[category] = [(section_idx, match_text, value), ...]  in order
+        seen: dict[str, list[tuple[int, str, str]]] = {}
+        contradictions = 0
+
+        for i, section in enumerate(sections):
+            for category, pattern in self._DEDUP_SUBJECT_KEYS:
+                if pattern is None:
+                    continue
+                for m in pattern.finditer(section):
+                    value = m.group(1).lower()
+                    match_text = m.group(0)
+                    # Check if we already have a DIFFERENT value for this category
+                    if category in seen:
+                        prior_values = {v for _, _, v in seen[category]}
+                        if value not in prior_values:
+                            contradictions += 1
+                            logger.debug(
+                                "Honcho dedup: suppressing %s '%s' from section %d "
+                                "(overridden by later section)",
+                                category, next(iter(prior_values)), i,
+                            )
+                    seen.setdefault(category, []).append((i, match_text, value))
+
+        if not contradictions:
+            return text
+
+        # For each category, keep only lines whose value matches the *last*
+        # section's value for that category.
+        latest_values: dict[str, str] = {}
+        for category, entries in seen.items():
+            # Get the last entry
+            latest_values[category] = entries[-1][2]
+
+        # Remove from earlier sections the match-text lines whose value
+        # doesn't match the latest
+        new_sections = []
+        suppressed_count = 0
+        for i, section in enumerate(sections):
+            lines = section.split('\n')
+            kept = []
+            for line in lines:
+                # Check if this line contains a suppressed contradiction
+                suppress = False
+                for category, entries in seen.items():
+                    for entry in entries:
+                        if entry[0] == i:
+                            _, match_text, value = entry
+                            if value != latest_values[category] and match_text in line:
+                                suppress = True
+                                suppressed_count += 1
+                                logger.debug(
+                                    "Honcho dedup: removed line '%s' - %s '%s' != '%s'",
+                                    line[:60], category, value, latest_values[category],
+                                )
+                                break
+                    if suppress:
+                        break
+                if not suppress:
+                    kept.append(line)
+            new_sections.append('\n'.join(kept))
+
+        result = '\n\n'.join(new_sections)
+        logger.debug("Honcho dedup: suppressed %d line(s) in %d category(ies)",
+                     suppressed_count, contradictions)
+        return result
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Track turn count for cadence and injection_frequency logic."""

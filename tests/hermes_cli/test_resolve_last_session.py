@@ -8,9 +8,11 @@ from hermes_cli.main import _resolve_last_session
 class _FakeDB:
     def __init__(self, rows):
         self._rows = rows
+        self.calls = []
         self.closed = False
 
     def search_sessions(self, source=None, limit=20, **_kw):
+        self.calls.append((source, limit))
         rows = [r for r in self._rows if r.get("source") == source] if source else list(self._rows)
         rows.sort(
             key=lambda r: float(r.get("last_active") or r.get("started_at") or 0),
@@ -43,6 +45,54 @@ def test_resolve_last_session_prefers_last_active_over_started_at(monkeypatch):
     monkeypatch.setattr("hermes_state.SessionDB", lambda: fake_db)
 
     assert _resolve_last_session("cli") == "old_started_recently_active"
+    assert fake_db.closed
+
+
+def test_resolve_last_session_falls_back_to_any_source_when_source_empty(monkeypatch):
+    rows = [
+        {
+            "id": "older_discord",
+            "source": "discord",
+            "started_at": 100.0,
+            "last_active": 100.0,
+        },
+        {
+            "id": "newer_slack",
+            "source": "slack",
+            "started_at": 200.0,
+            "last_active": 200.0,
+        },
+    ]
+
+    fake_db = _FakeDB(rows)
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: fake_db)
+
+    assert _resolve_last_session("cli") == "newer_slack"
+    assert fake_db.calls == [("cli", 1), (None, 1)]
+    assert fake_db.closed
+
+
+def test_resolve_last_session_uses_source_when_available(monkeypatch):
+    rows = [
+        {
+            "id": "older_cli",
+            "source": "cli",
+            "started_at": 100.0,
+            "last_active": 100.0,
+        },
+        {
+            "id": "newer_discord",
+            "source": "discord",
+            "started_at": 200.0,
+            "last_active": 200.0,
+        },
+    ]
+
+    fake_db = _FakeDB(rows)
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: fake_db)
+
+    assert _resolve_last_session("cli") == "older_cli"
+    assert fake_db.calls == [("cli", 1)]
     assert fake_db.closed
 
 

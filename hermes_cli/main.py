@@ -929,13 +929,18 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
 
 
 def _resolve_last_session(source: str = "cli") -> Optional[str]:
-    """Look up the most recently-used session ID for a source."""
+    """Look up the most recently-used session ID for a source.
+
+    Falls back to any source if the specified source has no sessions.
+    """
     db = None
     try:
         from hermes_state import SessionDB
 
         db = SessionDB()
         sessions = db.search_sessions(source=source, limit=1)
+        if not sessions and source is not None:
+            sessions = db.search_sessions(source=None, limit=1)
         return sessions[0]["id"] if sessions else None
     except Exception:
         pass
@@ -1750,8 +1755,8 @@ def cmd_chat(args):
             # -c with no argument — continue the most recent session
             source = "tui" if use_tui else "cli"
             last_id = _resolve_last_session(source=source)
-            if not last_id and source == "tui":
-                last_id = _resolve_last_session(source="cli")
+            if not last_id:
+                last_id = _resolve_last_session(source=None)
             if last_id:
                 args.resume = last_id
             else:
@@ -7444,7 +7449,7 @@ def _update_via_zip(args):
                     break
 
         # Copy updated files over existing installation, preserving venv/node_modules/.git
-        preserve = {"venv", "node_modules", ".git", ".env"}
+        preserve = {".venv", "node_modules", ".git", ".env"}
         update_count = 0
         for item in os.listdir(extracted):
             if item in preserve:
@@ -7482,7 +7487,7 @@ def _update_via_zip(args):
     pip_cmd = [sys.executable, "-m", "pip"]
     uv_bin = shutil.which("uv") or _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
-        uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / ".venv")}
         if _is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
@@ -8071,11 +8076,12 @@ def _is_windows() -> bool:
 
 def _venv_scripts_dir() -> Path | None:
     """Return the venv Scripts directory if we're running inside the project venv."""
-    venv_dir = PROJECT_ROOT / "venv"
-    if not venv_dir.is_dir():
-        return None
-    scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
-    return scripts if scripts.is_dir() else None
+    for candidate in (".venv", "venv"):
+        venv_dir = PROJECT_ROOT / candidate
+        if venv_dir.is_dir():
+            scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
+            return scripts if scripts.is_dir() else None
+    return None
 
 
 def _hermes_exe_shims(scripts_dir: Path) -> list[Path]:
@@ -9653,7 +9659,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         install_group = "all"
 
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / ".venv")}
             if _is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)

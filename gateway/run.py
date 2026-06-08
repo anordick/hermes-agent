@@ -6117,6 +6117,11 @@ class GatewayRunner:
                             bad_ticks,
                         )
                         last_warn_at = now
+                else:
+                    if not ready_pending and not any_spawned:
+                        logger.info(
+                            "kanban dispatcher: heartbeat \u2014 0 ready tasks, 0 spawned"
+                        )
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 raise

@@ -269,13 +269,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _stale_timeout = max(_stale_timeout, 600.0)
 
     if _est_tokens_for_codex_watchdog > 100_000:
-        _codex_idle_timeout_default = 180.0
+        _codex_idle_timeout_default = 600.0
     elif _est_tokens_for_codex_watchdog > 50_000:
-        _codex_idle_timeout_default = 120.0
+        _codex_idle_timeout_default = 600.0
     elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
+        _codex_idle_timeout_default = 300.0
     else:
-        _codex_idle_timeout_default = 12.0
+        _codex_idle_timeout_default = 60.0
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
@@ -285,7 +285,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # reconnect promptly when the socket is genuinely wedged. Set
     # HERMES_CODEX_TTFB_TIMEOUT_SECONDS=0 to disable this watchdog entirely.
     _ttfb_enabled = _codex_watchdog_enabled
-    _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 300.0)
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
     elif _openai_codex_backend:
@@ -307,7 +307,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _ttfb_disable_above,
             )
         else:
-            _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
+            _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 300.0)
             if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
                 logger.info(
                     "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "

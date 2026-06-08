@@ -80,6 +80,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sys
+import re
 import threading
 import logging
 import time
@@ -4484,7 +4486,15 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive a task and raise a guardrail alert if it was a coaching/alignment
+    card that was cancelled without ever completing a run."""
     with write_txn(conn):
+        # Read title before archiving - needed for guardrail check below.
+        title_row = conn.execute(
+            "SELECT title FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        title = str(title_row["title"]) if title_row else ""
+
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -4493,18 +4503,43 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        # If archive happened while a run was still in flight (e.g. user
-        # archived a running task from the dashboard), close that run with
-        # outcome='reclaimed' so attempt history isn't orphaned.
         run_id = _end_run(
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    # ``archived`` parents no longer block children, same as ``done``.
-    # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
+
+        # --- Guardrail: cancelled coaching/alignment/briefing card ---
+        if title and re.search(
+            r"coach|alignment|supervision|briefing|guidance",
+            title, re.IGNORECASE,
+        ):
+            has_completed_run = bool(
+                conn.execute(
+                    "SELECT 1 FROM task_runs "
+                    "WHERE task_id = ? AND outcome IS NOT NULL LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            )
+            if not has_completed_run:
+                _log.warning(
+                    "guardrail: archived coaching/alignment card %r "
+                    "(title=%r) had zero completed runs",
+                    task_id, title,
+                )
+                _append_event(
+                    conn, task_id, "guardrail_alert",
+                    {
+                        "reason": (
+                            "archived without ever running - coaching/"
+                            "alignment guidance was not delivered"
+                        ),
+                        "title": title,
+                    },
+                )
+        # --- end guardrail ---
+
     recompute_ready(conn)
     return True
 

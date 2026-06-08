@@ -1539,6 +1539,354 @@ def cmd_migrate(args) -> None:
     print()
 
 
+_CARD_SYNTHESIS_MODEL = "openai/gpt-4o-mini"
+"""Default small model for card correction synthesis.
+
+Can be overridden via HONCHO_PRUNE_MODEL env var for a larger model
+when corrections need deeper reasoning.
+"""
+
+
+def _synthesize_corrected_card(
+    current_card: list[str],
+    current_representation: str,
+    corrective_prompt: str,
+) -> list[str]:
+    """Use a small LLM to synthesize a corrected peer card from a corrective prompt.
+
+    Sends current card + representation + corrective instruction to a
+    lightweight model and returns the proposed new card as a list of strings.
+
+    Falls back to a simple placeholder if the API call fails.
+    """
+    model = os.environ.get("HONCHO_PRUNE_MODEL", _CARD_SYNTHESIS_MODEL)
+    api_key = os.environ.get("OPENROUTER_API_KEY") or ""
+
+    if not api_key:
+        # No API key — do a basic heuristic instead of failing silently
+        print("  No OPENROUTER_API_KEY found. Using basic text filter.\n")
+        return _heuristic_card_filter(current_card, corrective_prompt)
+
+    system_prompt = (
+        "You are a memory curator for an AI agent's peer store. "
+        "Your job is to surgically correct a peer card based on a user's corrective instruction. "
+        "A peer card is a list of factual strings about a user or AI entity.\n\n"
+        "Rules:\n"
+        "1. Apply ONLY the corrections explicitly requested. Preserve all other facts.\n"
+        "2. Return the corrected card as a JSON array of strings.\n"
+        "3. When removing stale information, delete the entire fact string, don't rephrase it.\n"
+        "4. When adding new information, add a single concise fact string.\n"
+        "5. Output ONLY the JSON array, no explanation, no markdown fences.\n"
+        "6. Do NOT add facts beyond what the corrective prompt asks for."
+    )
+
+    card_text = "\n".join(f"- {f}" for f in current_card) if current_card else "(empty)"
+    rep_text = current_representation[:2000] if current_representation else "(none)"
+
+    prompt = (
+        f"CURRENT PEER CARD:\n{card_text}\n\n"
+        f"CURRENT REPRESENTATION (truncated):\n{rep_text}\n\n"
+        f"CORRECTIVE INSTRUCTION:\n{corrective_prompt}\n\n"
+        "Return only the corrected peer card as a JSON array of strings."
+    )
+
+    import httpx
+    try:
+        resp = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 2000,
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        content = body["choices"][0]["message"]["content"].strip()
+
+        # Strip markdown fences if present
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1]
+            if "```" in content:
+                content = content.rsplit("```", 1)[0]
+            content = content.strip()
+
+        proposed = json.loads(content)
+        if isinstance(proposed, list) and all(isinstance(f, str) for f in proposed):
+            return proposed
+
+        print(f"  Warning: unexpected response shape, using original card\n")
+        return list(current_card)
+    except Exception as e:
+        print(f"  LLM synthesis failed ({e}), falling back to heuristic filter\n")
+        return _heuristic_card_filter(current_card, corrective_prompt)
+
+
+def _heuristic_card_filter(
+    current_card: list[str],
+    corrective_prompt: str,
+) -> list[str]:
+    """Basic heuristic filter when no LLM is available.
+
+    Removes any fact that contains a word from the corrective prompt's
+    negative directives (e.g. 'remove', 'delete', 'drop' followed by
+    a named entity).
+    """
+    lower_correction = corrective_prompt.lower()
+
+    # Check for "remove X" / "delete X" / "drop X" patterns
+    remove_targets: list[str] = []
+    for keyword in ("remove", "delete", "drop", "strip", "prune"):
+        parts = lower_correction.split(keyword, 1)
+        if len(parts) > 1:
+            rest = parts[1].strip()
+            # Extract quoted text like '"Alyssa"' or "'Alyssa'"
+            for q in ('"', "'"):
+                if rest.startswith(q):
+                    end = rest.find(q, 1)
+                    if end > 0:
+                        remove_targets.append(rest[1:end].strip().lower())
+                        break
+            # Otherwise take the first word
+            if not remove_targets:
+                first_word = rest.split()[0].strip(".,!?;:")
+                if first_word:
+                    remove_targets.append(first_word)
+
+    if not remove_targets:
+        # No explicit targets found — can't safely prune with heuristics
+        return list(current_card)
+
+    filtered = [
+        f for f in current_card
+        if not any(target in f.lower() for target in remove_targets)
+    ]
+    return filtered
+
+
+def _render_diff(
+    label: str,
+    current: list[str],
+    proposed: list[str],
+) -> None:
+    """Print a line-by-line diff between current and proposed card."""
+    if current == proposed:
+        print(f"  {label}: (no changes)")
+        return
+
+    current_set = set(current)
+    proposed_set = set(proposed)
+
+    removed = current_set - proposed_set
+    added = proposed_set - current_set
+    kept = current_set & proposed_set
+
+    print(f"\n  {label} changes:")
+    if removed:
+        for fact in sorted(removed):
+            print(f"    - {fact}")
+    if added:
+        for fact in sorted(added):
+            print(f"    + {fact}")
+    if kept and not removed and not added:
+        # Order change — show the full card
+        print(f"    (order/formatting changes only)")
+        print(f"\n  Proposed {label}:")
+        for fact in proposed:
+            print(f"    * {fact}")
+    elif kept:
+        print(f"    ({len(kept)} fact(s) unchanged)")
+
+
+def cmd_prune_peer(args) -> None:
+    """Surgically correct a Honcho peer's card and representation.
+
+    Reads the target peer's current context (representation + card),
+    takes a corrective prompt, synthesizes a corrected card, and
+    applies it. Designed for targeted memory correction without
+    full peer wipe.
+    """
+    cfg = _read_config()
+    if not _resolve_api_key(cfg):
+        print("  No API key configured. Run 'hermes honcho setup' first.\n")
+        return
+
+    peer_arg = getattr(args, "peer_id", None)
+    prompt_text = getattr(args, "prompt", None)
+    force = getattr(args, "force", False)
+    dry_run = getattr(args, "dry_run", False)
+
+    if not peer_arg:
+        print("  Usage: hermes honcho prune-peer <peer_id> [--prompt \"...\"] [--dry-run] [--force]\n")
+        return
+
+    # Read prompt from stdin if not provided via --prompt
+    if not prompt_text:
+        if sys.stdin.isatty():
+            print("  Enter corrective prompt (Ctrl+D to finish):")
+        prompt_text = sys.stdin.read().strip()
+        if not prompt_text:
+            print("  No corrective prompt provided.\n")
+            return
+
+    # Connect to Honcho
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+        from plugins.memory.honcho.session import HonchoSessionManager
+
+        hcfg = HonchoClientConfig.from_global_config(host=_host_key())
+        if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
+            print("  Honcho is not configured or disabled. Run 'hermes honcho setup' first.\n")
+            return
+
+        client = get_honcho_client(hcfg)
+        mgr = HonchoSessionManager(honcho=client, config=hcfg)
+        session_key = hcfg.resolve_session_name()
+        mgr.get_or_create(session_key)
+
+        # Resolve the target peer ID
+        peer_id = peer_arg.strip()
+        # If it's a named alias, resolve through the session
+        session_obj = mgr._cache.get(session_key)
+        if session_obj:
+            if peer_id.lower() in ("user", "me"):
+                peer_id = session_obj.user_peer_id
+            elif peer_id.lower() in ("ai", "assistant"):
+                peer_id = session_obj.assistant_peer_id
+
+    except Exception as e:
+        print(f"  Honcho connection failed: {e}\n")
+        return
+
+    # Fetch current peer context
+    try:
+        peer_obj = mgr._get_or_create_peer(peer_id)
+
+        # Try peer.context() for representation + card together
+        current_representation = ""
+        current_card: list[str] = []
+        try:
+            ctx = peer_obj.context(target=peer_id)
+            current_representation = getattr(ctx, "representation", "") or ""
+            raw_card = getattr(ctx, "peer_card", None) or []
+            current_card = (
+                [str(f) for f in raw_card]
+                if isinstance(raw_card, list)
+                else []
+            )
+        except Exception:
+            pass
+
+        # Fallback: separate calls
+        if not current_representation:
+            try:
+                current_representation = peer_obj.representation(target=peer_id) or ""
+            except Exception:
+                pass
+
+        if not current_card:
+            try:
+                raw = peer_obj.get_card(target=peer_id) or []
+                current_card = [str(f) for f in raw] if isinstance(raw, list) else []
+            except Exception:
+                pass
+
+        if not current_card and not current_representation:
+            print(f"  Peer '{peer_id}' has no card or representation to prune.\n")
+            return
+
+        print(f"\n  Peer: {peer_id}")
+        if current_card:
+            print(f"  Current card ({len(current_card)} fact(s)):")
+            for fact in current_card:
+                print(f"    - {fact}")
+        if current_representation:
+            truncated = current_representation[:300].replace("\n", " ")
+            print(f"  Current representation: {truncated}{'...' if len(current_representation) > 300 else ''}")
+        print()
+
+    except Exception as e:
+        print(f"  Failed to read peer context: {e}\n")
+        return
+
+    # Synthesize corrected card
+    print("  Synthesizing correction...", end=" ", flush=True)
+    proposed_card = _synthesize_corrected_card(
+        current_card, current_representation, prompt_text,
+    )
+    print("done\n")
+
+    # Check if anything changed
+    if proposed_card == current_card:
+        print("  No changes to apply.\n")
+        return
+
+    # Show diff
+    _render_diff("Card", current_card, proposed_card)
+
+    if dry_run:
+        print("\n  Dry-run mode: no changes written.\n")
+        return
+
+    # Confirm unless --force
+    if not force:
+        print()
+        answer = _prompt("Apply these changes?", default="n")
+        if answer.lower() not in ("y", "yes"):
+            print("  Aborted.\n")
+            return
+
+    # Write the corrected card
+    try:
+        # set_peer_card on the manager requires a session key. We need a session
+        # that has this peer as either observer or target. Resolve through manager.
+        if session_obj:
+            observer_peer_id, target_peer_id = mgr._resolve_observer_target(
+                session_obj, peer_arg,
+            )
+            result = mgr.set_peer_card(session_key, proposed_card, peer=peer_arg)
+        else:
+            # Fallback: direct SDK call
+            result = peer_obj.set_card(proposed_card, target=peer_id)
+
+        if result is not None:
+            print(f"  Peer card updated ({len(proposed_card)} fact(s)).\n")
+        else:
+            print("  Failed to update peer card.\n")
+            return
+    except Exception as e:
+        print(f"  Failed to set peer card: {e}\n")
+        return
+
+    # Verify by re-reading
+    print("  Verifying...", end=" ", flush=True)
+    try:
+        fresh = peer_obj.get_card(target=peer_id) or []
+        fresh_card = [str(f) for f in fresh] if isinstance(fresh, list) else []
+        if fresh_card == proposed_card:
+            print("OK")
+        else:
+            print("MISMATCH")
+            _render_diff("Verification", proposed_card, fresh_card)
+    except Exception as e:
+        print(f"verification failed: {e}")
+
+    # Suggest next step regarding representation
+    print(f"\n  Card corrected. Honcho's representation will update via its next")
+    print(f"  dialectic or dream cycle. Run 'hermes honcho identity --show'")
+    print(f"  later to confirm the representation reflects the corrected card.\n")
+
+
 def honcho_command(args) -> None:
     """Route honcho subcommands."""
     global _profile_override
@@ -1580,9 +1928,11 @@ def honcho_command(args) -> None:
         cmd_disable(args)
     elif sub == "sync":
         cmd_sync(args)
+    elif sub == "prune-peer":
+        cmd_prune_peer(args)
     else:
         print(f"  Unknown honcho command: {sub}")
-        print("  Available: status, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync\n")
+        print("  Available: status, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync, prune-peer\n")
 
 
 def register_cli(subparser) -> None:
@@ -1681,5 +2031,26 @@ def register_cli(subparser) -> None:
     subs.add_parser("enable", help="Enable Honcho for the active profile")
     subs.add_parser("disable", help="Disable Honcho for the active profile")
     subs.add_parser("sync", help="Sync Honcho config to all existing profiles")
+
+    prune_parser = subs.add_parser(
+        "prune-peer",
+        help="Surgically correct a peer's card from a corrective prompt",
+    )
+    prune_parser.add_argument(
+        "peer_id", metavar="PEER_ID",
+        help="Peer ID to correct (user/me/ai/assistant or explicit peer name)",
+    )
+    prune_parser.add_argument(
+        "--prompt", metavar="TEXT",
+        help="Corrective instruction (omit to read from stdin)",
+    )
+    prune_parser.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Show proposed changes without writing",
+    )
+    prune_parser.add_argument(
+        "--force", action="store_true",
+        help="Skip confirmation prompt",
+    )
 
     subparser.set_defaults(func=honcho_command)

@@ -43,7 +43,7 @@ JOBS_FILE = CRON_DIR / "jobs.json"
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
-ONESHOT_GRACE_SECONDS = 120
+ONESHOT_GRACE_SECONDS = 3600
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
