@@ -4867,7 +4867,7 @@ def resolve_nous_access_token(
 
             if not _is_expiring(state.get("expires_at"), refresh_skew_seconds):
                 if merged_shared:
-                    _save_provider_state(auth_store, "nous", state)
+                    _store_provider_state(auth_store, "nous", state, set_active=False)
                     _save_auth_store(auth_store)
                 return access_token
 
@@ -4903,7 +4903,7 @@ def resolve_nous_access_token(
                             exc,
                             reason="managed_access_token_refresh_failure",
                         )
-                        _save_provider_state(auth_store, "nous", state)
+                        _store_provider_state(auth_store, "nous", state, set_active=False)
                         _save_auth_store(auth_store)
                     raise
 
@@ -4925,7 +4925,7 @@ def resolve_nous_access_token(
                 "insecure": verify is False,
                 "ca_bundle": verify if isinstance(verify, str) else None,
             }
-            _save_provider_state(auth_store, "nous", state)
+            _store_provider_state(auth_store, "nous", state, set_active=False)
             _save_auth_store(auth_store)
             _write_shared_nous_state(state)
             return state["access_token"]
@@ -5183,7 +5183,7 @@ def resolve_nous_runtime_credentials(
                 )
                 return
             try:
-                _save_provider_state(auth_store, "nous", state)
+                _store_provider_state(auth_store, "nous", state, set_active=False)
                 _save_auth_store(auth_store)
             except Exception as exc:
                 _oauth_trace(
