@@ -5334,9 +5334,18 @@ class GatewayRunner:
                             elif task and task.result:
                                 r = task.result.strip().splitlines()[0][:160]
                                 handoff = f"\n{r}"
+                            # If completion unblocks child tasks, mention
+                            # them so gateway subscribers see the
+                            # dependency chain in action.
+                            unblocked = None
+                            if ev.payload and ev.payload.get("unblocked_children"):
+                                kids = ev.payload["unblocked_children"]
+                                ids = [k["id"] for k in kids]
+                                unblocked = f"\n   → Unblocks: {', '.join(ids)}"
                             msg = (
                                 f"✔ {tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
+                                f"{unblocked or ''}"
                             )
                         elif kind == "blocked":
                             reason = ""

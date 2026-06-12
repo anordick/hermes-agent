@@ -563,7 +563,56 @@ def run_conversation(
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
-    
+
+    # ── Crucible Deep: pre-process user message ─────────────────────────
+    # When CRUCIBLE_DEEP_ENABLED=1, run Deep's investigation BEFORE DS
+    # processes the message. Deep gathers system data, calls tools, and
+    # produces structured findings. DS sees the original message + Deep's
+    # report in its first API call — no double processing.
+    # Kill switch: touch ~/.hermes/crucible-deep-kill to disable instantly.
+    _deep_kill = os.path.expanduser("~/.hermes/crucible-deep-kill")
+    if (
+        os.environ.get("CRUCIBLE_DEEP_ENABLED", "") == "1"
+        and isinstance(user_message, str)
+        and user_message.strip()
+        and not os.path.isfile(_deep_kill)
+    ):
+        try:
+            from tools.crucible_tool import crucible_deep as _deep
+            _t0 = time.monotonic()
+            _result = _deep(goal=user_message)
+            _latency = time.monotonic() - _t0
+            _data = json.loads(_result)
+            _findings = _data.get("report", "")
+            _deep_turns = _data.get("turns", 0)
+            _deep_calls = len(_data.get("poc_raw_outputs", []))
+            _findings_size = len(str(_findings))
+            if _findings:
+                _context = (
+                    "\n\n── Crucible Deep Investigation ──\n"
+                    "Before responding, automated system investigation was run. "
+                    "Findings below are structured data from local diagnostics.\n"
+                    f"{json.dumps(_findings, indent=2) if isinstance(_findings, dict) else _findings}\n"
+                    "── End Crucible Deep Investigation ──"
+                )
+                messages[-1] = {
+                    "role": "user",
+                    "content": user_message + _context,
+                }
+                logger.info(
+                    "Crucible Deep pre-process: lat=%.1fs findings=%d chars "
+                    "deep_turns=%d deep_calls=%d",
+                    _latency, _findings_size, _deep_turns, _deep_calls,
+                )
+            # Store Deep economics on agent for post-loop logging
+            _deep_ran = True
+            agent._deep_latency = _latency
+            agent._deep_findings_size = _findings_size
+            agent._deep_turns = _deep_turns
+            agent._deep_calls = _deep_calls
+        except Exception as _deep_err:
+            logger.warning("Crucible Deep pre-process failed: %s", _deep_err)
+
     if not agent.quiet_mode:
         _print_preview = _summarize_user_message_for_log(user_message)
         agent._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
@@ -4743,6 +4792,21 @@ def run_conversation(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    # ── Crucible Deep: log DS tool usage after Deep pre-process ──────
+    if getattr(agent, "_deep_latency", None) is not None:
+        _ds_tool_calls = sum(
+            1 for m in messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        logger.info(
+            "Crucible Deep economics: ds_tool_calls=%d deep_lat=%.1fs "
+            "deep_findings=%d deep_turns=%d deep_calls=%d",
+            _ds_tool_calls, agent._deep_latency, agent._deep_findings_size,
+            agent._deep_turns, agent._deep_calls,
+        )
+        # Reset for next turn
+        agent._deep_latency = None
 
     return result
 

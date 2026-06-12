@@ -3648,6 +3648,20 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        # Include children that will be unblocked by this completion so
+        # gateway notifiers and dashboard consumers can render the
+        # dependency chain without a second SQL round-trip.
+        children = child_ids(conn, task_id)
+        if children:
+            child_rows = conn.execute(
+                f"SELECT id, title FROM tasks WHERE id IN ("
+                f"{','.join('?' for _ in children)})",
+                children,
+            ).fetchall()
+            completed_payload["unblocked_children"] = [
+                {"id": r["id"], "title": (r["title"] or "")[:80]}
+                for r in child_rows
+            ]
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -6763,6 +6777,20 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    # Surface children that will be unblocked when this task completes.
+    # Helps orchestrator workers see what follow-up work depends on them.
+    child_rows = conn.execute(
+        "SELECT t.id, t.title, t.status "
+        "FROM task_links l JOIN tasks t ON t.id = l.child_id "
+        "WHERE l.parent_id = ? ORDER BY l.child_id",
+        (task_id,),
+    ).fetchall()
+    if child_rows:
+        child_summary = "; ".join(
+            f"{r['id']}: {_cap(r['title'], 60)} [{r['status']}]"
+            for r in child_rows
+        )
+        lines.append(f"Children: {child_summary}")
     lines.append("")
 
     if task.body and task.body.strip():

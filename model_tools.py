@@ -990,6 +990,42 @@ def handle_function_call(
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
+        # ── Project Crucible Lite: auto-route terminal/file output through Qwen ──
+        # When CRUCIBLE_ENABLED=1 (set in root .env), every terminal and read_file
+        # result is piped through crucible_lite for inline formatting.
+        # Only Vaile has this — she inherits from root config.
+        # Other profiles do NOT have auto-route; they call crucible_deep (gemma)
+        # explicitly for local tool execution.
+        # Vaile can also call crucible_lite and crucible on demand.
+        # Fail-open: if error, raw result passes through unchanged.
+        # Kill switch: touch ~/.hermes/crucible-kill to disable instantly (no restart)
+        _kill_file = os.path.expanduser("~/.hermes/crucible-kill")
+        if os.path.isfile(_kill_file):
+            pass  # Kill switch active — skip auto-route
+        elif (os.environ.get("CRUCIBLE_ENABLED", "") == "1"
+        # Skip Lite if Deep is already active — avoids double processing
+        and os.environ.get("CRUCIBLE_DEEP_ENABLED", "") != "1"
+        and function_name in ("terminal", "read_file")
+        and isinstance(result, str)):
+            try:
+                import json as _json
+                _parsed = _json.loads(result)
+                # Extract the text content — terminal uses "output", read_file uses "content"
+                _text = _parsed.get("output") or _parsed.get("content") or ""
+                if _text and isinstance(_text, str) and _text.strip():
+                    from tools.crucible_lite_tool import crucible_lite as _crucible
+                    _task = (
+                        "Parse and structure this data. Extract all fields, "
+                        "values, and relationships as structured JSON."
+                    )
+                    _crucible_result = _crucible(task=_task, context=_text)
+                    _crucible_data = _json.loads(_crucible_result)
+                    # Inject parsed output alongside raw — agent sees both
+                    _parsed["crucible"] = _crucible_data.get("qwen_output", "")
+                    result = _json.dumps(_parsed, ensure_ascii=False)
+            except Exception:
+                pass  # Fail-open: raw result passes through unchanged
+
         try:
             from hermes_cli.plugins import invoke_hook
             invoke_hook(
