@@ -85,9 +85,10 @@ import re
 import threading
 import logging
 import time
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from toolsets import get_toolset_names
 
@@ -98,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "dispatched", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -2983,8 +2984,7 @@ def claim_task(
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
+               AND (status = 'dispatched' OR (status = 'ready' AND claim_lock IS NULL))
             """,
             (lock, expires, now, task_id),
         )
@@ -3168,9 +3168,9 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "WHERE status IN ('running', 'dispatched') AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
@@ -3226,6 +3226,21 @@ def release_stale_claims(
                     },
                     run_id=run_id,
                 )
+            continue
+
+        # "dispatched" cards have no worker PID — just a placeholder
+        # claim_lock to prevent re-dispatch. Reset to 'ready' directly
+        # so the next daemon tick can re-dispatch if needed.
+        if row["status"] == "dispatched" or not row["worker_pid"]:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL "
+                    "WHERE id=? AND status='dispatched' AND claim_lock IS ? "
+                    "AND claim_expires IS NOT NULL AND claim_expires < ?",
+                    (row["id"], row["claim_lock"], now),
+                )
+            reclaimed += 1
             continue
 
         termination = _terminate_reclaimed_worker(
@@ -5908,7 +5923,7 @@ def dispatch_once(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, title, priority FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -6078,6 +6093,39 @@ def dispatch_once(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+
+        # When dispatch_via_cron is active, skip the claim — the worker
+        # claims independently when its cron session starts.
+        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        if _spawn is _spawn_via_cron:
+            # Pass row data without claiming. Wrap in a simple object
+            # for attribute-style access (_spawn_via_cron uses task.id,
+            # task.title, task.assignee, task.priority).
+            from types import SimpleNamespace
+            proxy = SimpleNamespace(
+                id=row["id"],
+                assignee=row_assignee,
+                title=row["title"] if row["title"] is not None else "",
+                priority=row["priority"],
+            )
+            _spawn(proxy, "", board=board)
+            result.spawned.append((row["id"], row_assignee, "cron"))
+            # Set claim lock so daemon won't re-dispatch this card.
+            # Worker claims independently via claim_task(conn, id) which
+            # now accepts 'ready' or 'dispatched' as pre-claim status.
+            # TTL-based reclaim in release_stale_claims returns expired
+            # "dispatched" locks to 'ready' for re-dispatch.
+            _ttl = _resolve_claim_ttl_seconds(ttl_seconds)
+            now = int(time.time())
+            lock = f"cron:{_claimer_id()}"
+            conn.execute(
+                "UPDATE tasks SET status='dispatched', "
+                "claim_lock=?, claim_expires=?, started_at=COALESCE(started_at, ?) "
+                "WHERE id=? AND status='ready'",
+                (lock, now + _ttl, now, row["id"]),
+            )
+            continue
+
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -6487,6 +6535,11 @@ def _default_spawn(
     via the ``complete`` / ``block`` transitions the worker writes itself;
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
+    ``kanban.worker_prompt`` controls the prompt passed to the worker:
+    ``default`` keeps the historical ``work kanban task <id>`` prompt, while
+    ``profile`` lets the profile config provide
+    ``kanban.worker_prompt_template``.
+
     ``board`` pins the child's kanban context to that board: the child's
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
@@ -6500,8 +6553,8 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    prompt = f"work kanban task {task.id}"
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -6513,14 +6566,49 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    profile_home = None
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        profile_home = env["HERMES_HOME"]
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = load_config().get("kanban") or {}
+    except Exception:
+        kanban_cfg = {}
+    if kanban_cfg.get("worker_prompt") == "profile" and profile_home:
+        template = None
+        try:
+            with open(Path(profile_home) / "config.yaml", "r", encoding="utf-8") as f:
+                profile_cfg = yaml.safe_load(f) or {}
+            profile_kanban_cfg = (
+                profile_cfg.get("kanban") if isinstance(profile_cfg, dict) else None
+            )
+            if isinstance(profile_kanban_cfg, dict):
+                template = profile_kanban_cfg.get("worker_prompt_template")
+        except Exception:
+            template = None
+        if isinstance(template, str) and template:
+            state = ""
+            try:
+                state = (
+                    Path.home()
+                    / ".farpoint"
+                    / f"{task.assignee}-state.md"
+                ).read_text(encoding="utf-8")[:2000]
+            except OSError:
+                pass
+            prompt = template.format(
+                id=task.id,
+                profile=task.assignee,
+                state=state,
+            )
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -6659,6 +6747,56 @@ def _default_spawn(
     return proc.pid
 
 
+def _spawn_via_cron(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn a kanban worker via a one-shot cron job instead of subprocess.
+
+    Creates a single-shot cron job that runs the kanban worker as a full
+    profile session. The task ID, title, and priority are embedded in the
+    prompt since cron jobs don't pass arbitrary env vars on their own.
+
+    Returns ``None`` — no PID to track, so crash detection falls back to
+    TTL-based reclaim via ``dispatch_stale_timeout_seconds``. This is
+    acceptable: the TTL is the primary crash-detection mechanism; PID-based
+    detection was always a faster-but-optional safety net.
+
+    Enabled via config: ``kanban.dispatch_via_cron: true``.
+
+    Prompt format::
+        Work kanban task {task.id}: {task.title} (priority {task.priority or 'unset'})
+
+    The ``kanban-worker`` skill ships a ``_discover_task_id()`` regex parser
+    that extracts the task ID from this prompt — workers spawned via cron
+    use it as the canonical ID source since ``HERMES_KANBAN_TASK`` is not
+    set in the cron env.
+    """
+    if not task.assignee:
+        raise ValueError(f"task {task.id} has no assignee")
+
+    from cron.jobs import create_job
+
+    prompt = (
+        f"Work kanban task {task.id}: {task.title} "
+        f"(priority {task.priority if task.priority is not None else 'unset'})"
+    )
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+
+    create_job(
+        profile=task.assignee,
+        prompt=prompt,
+        schedule="1m",
+        repeat=1,
+        skills=["kanban-worker"],
+        name=f"kron-{resolved_board}-{task.id}",
+        deliver="local",
+    )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
@@ -6698,11 +6836,21 @@ def run_daemon(
                 except (ValueError, OSError):
                     pass
 
+    # Resolve spawn_fn from config so dispatch_via_cron works in daemon mode.
+    _spawn_fn: Optional[Callable] = None
+    try:
+        from hermes_cli.config import load_config
+        if (load_config().get("kanban") or {}).get("dispatch_via_cron", False):
+            _spawn_fn = _spawn_via_cron
+    except Exception:
+        pass  # fall through to default spawn
+
     while not stop_event.is_set():
         try:
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,
+                    spawn_fn=_spawn_fn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
                 )
